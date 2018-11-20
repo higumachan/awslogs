@@ -8,9 +8,9 @@ import boto3
 from botocore.client import ClientError
 from termcolor import colored
 
-from . import exceptions
-from .core import AWSLogs
-from ._version import __version__
+from awslogs import exceptions
+from awslogs.core import AWSLogs
+from awslogs._version import __version__
 
 
 def main(argv=None):
@@ -206,3 +206,7 @@ def main(argv=None):
         return 1
 
     return 0
+
+
+if __name__ == '__main__':
+    main()

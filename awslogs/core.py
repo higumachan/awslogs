@@ -3,6 +3,7 @@ import sys
 import os
 import time
 import errno
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from collections import deque
 
@@ -15,7 +16,7 @@ from termcolor import colored
 from dateutil.parser import parse
 from dateutil.tz import tzutc
 
-from . import exceptions
+from awslogs import exceptions
 
 
 def milis2iso(milis):
@@ -31,6 +32,7 @@ class AWSLogs(object):
 
     FILTER_LOG_EVENTS_STREAMS_LIMIT = 100
     MAX_EVENTS_PER_CALL = 10000
+    MAX_DOWNLOAD_WORKERS = 10
     ALL_WILDCARD = 'ALL'
 
     def __init__(self, **kwargs):
@@ -90,7 +92,7 @@ class AWSLogs(object):
         # ! Error during pagination: The same next token was received twice
         do_wait = object()
 
-        def generator():
+        def generator(start, end, is_tail):
             """Yield events into trying to deduplicate them using a lru queue.
             AWS API stands for the interleaved parameter that:
                 interleaved (boolean) -- If provided, the API will make a best
@@ -104,6 +106,7 @@ class AWSLogs(object):
                 next_token. The site of this queue is MAX_EVENTS_PER_CALL in
                 order to not exhaust the memory.
             """
+            print('start {}'.format(start))
             interleaving_sanity = deque(maxlen=self.MAX_EVENTS_PER_CALL)
             kwargs = {'logGroupName': self.log_group_name,
                       'interleaved': True}
@@ -112,17 +115,21 @@ class AWSLogs(object):
                 kwargs['logStreamNames'] = streams
 
             if self.start:
-                kwargs['startTime'] = self.start
+                kwargs['startTime'] = start
 
             if self.end:
-                kwargs['endTime'] = self.end
+                kwargs['endTime'] = end
 
             if self.filter_pattern:
                 kwargs['filterPattern'] = self.filter_pattern
 
+            kwargs['limit'] = 10000
+
             while True:
                 response = self.client.filter_log_events(**kwargs)
+                print('call log events {}'.format(start))
 
+                #print(response.get('events', []))
                 for event in response.get('events', []):
                     if event['eventId'] not in interleaving_sanity:
                         interleaving_sanity.append(event['eventId'])
@@ -130,12 +137,26 @@ class AWSLogs(object):
 
                 if 'nextToken' in response:
                     kwargs['nextToken'] = response['nextToken']
-                else:
+                elif is_tail:
                     yield do_wait
+                else:
+                    break
+            print('finish {}'.format(start))
 
         def consumer():
-            for event in generator():
+            periods = self._split_period(self.start, self.end, 32)
+            print(periods)
 
+            generators = [generator(start, end, False) for start, end in periods]
+            executor = ThreadPoolExecutor(max_workers=self.MAX_DOWNLOAD_WORKERS)
+
+            for events in executor.map(list, generators):
+                #print(events)
+                for event in events:
+                    output = self._create_output(event, max_stream_length, group_length)
+                    print(' '.join(output))
+
+            for event in generator(periods[-1][1], None, True):
                 if event is do_wait:
                     if self.watch:
                         time.sleep(1)
@@ -143,44 +164,7 @@ class AWSLogs(object):
                     else:
                         return
 
-                output = []
-                if self.output_group_enabled:
-                    output.append(
-                        self.color(
-                            self.log_group_name.ljust(group_length, ' '),
-                            'green'
-                        )
-                    )
-                if self.output_stream_enabled:
-                    output.append(
-                        self.color(
-                            event['logStreamName'].ljust(max_stream_length,
-                                                         ' '),
-                            'cyan'
-                        )
-                    )
-                if self.output_timestamp_enabled:
-                    output.append(
-                        self.color(
-                            milis2iso(event['timestamp']),
-                            'yellow'
-                        )
-                    )
-                if self.output_ingestion_time_enabled:
-                    output.append(
-                        self.color(
-                            milis2iso(event['ingestionTime']),
-                            'blue'
-                        )
-                    )
-
-                message = event['message']
-                if self.query is not None and message[0] == '{':
-                    parsed = json.loads(event['message'])
-                    message = self.query_expression.search(parsed)
-                    if not isinstance(message, six.string_types):
-                        message = json.dumps(message)
-                output.append(message.rstrip())
+                output = self._create_output(event, max_stream_length, group_length)
 
                 print(' '.join(output))
                 try:
@@ -267,4 +251,56 @@ class AWSLogs(object):
                 date = date.astimezone(tzutc())
             date = date.replace(tzinfo=None)
 
+        return self.to_unixtime(date)
+
+    def to_unixtime(self, date):
         return int(total_seconds(date - datetime(1970, 1, 1))) * 1000
+
+    def _split_period(self, start, end, num):
+        print(start, end, num)
+        if end is None:
+            end = self.to_unixtime(datetime.now())
+        span = (end - start) // num
+        return [(start + span * i, start + span * (i + 1)) for i in range(num - 1)] + [(start + span * (num - 1), end)]
+
+    def _create_output(self, event, max_stream_length, group_length):
+        output = []
+        if self.output_group_enabled:
+            output.append(
+                self.color(
+                    self.log_group_name.ljust(group_length, ' '),
+                    'green'
+                )
+            )
+        if self.output_stream_enabled:
+            output.append(
+                self.color(
+                    event['logStreamName'].ljust(max_stream_length,
+                                                 ' '),
+                    'cyan'
+                )
+            )
+        if self.output_timestamp_enabled:
+            output.append(
+                self.color(
+                    milis2iso(event['timestamp']),
+                    'yellow'
+                )
+            )
+        if self.output_ingestion_time_enabled:
+            output.append(
+                self.color(
+                    milis2iso(event['ingestionTime']),
+                    'blue'
+                )
+            )
+
+        message = event['message']
+        if self.query is not None and message[0] == '{':
+            parsed = json.loads(event['message'])
+            message = self.query_expression.search(parsed)
+            if not isinstance(message, six.string_types):
+                message = json.dumps(message)
+        output.append(message.rstrip())
+
+        return output
